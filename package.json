@@ -1,5 +1,5 @@
 {
-  "name": "lan-talk-cloudflare",
+  "name": "speak-blessing-cloudflare",
   "version": "1.0.0",
   "scripts": { "dev": "wrangler dev", "deploy": "wrangler deploy" },
   "dependencies": { "qrcode-generator": "^1.4.4" },
