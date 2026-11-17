@@ -49,7 +49,7 @@ box-shadow:inset 0 0 0 2px var(--ln),0 0 0 8px var(--bg),0 0 0 10px var(--ln);fo
 .ptt.muted{color:var(--bad)}
 @media (prefers-reduced-motion:no-preference){.ptt{transition:box-shadow .08s,background .08s}}
 #lvl{height:6px;background:var(--sf);border-radius:3px;overflow:hidden}
-#lvl i{display:block;height:100%;background:var(--rx);transform-origin:left;transform:scaleX(0)}
+#lvl{position:relative}#lvl u{position:absolute;top:0;bottom:0;width:2px;background:var(--on);display:none}#lvl i{display:block;height:100%;background:var(--rx);transform-origin:left;transform:scaleX(0)}
 details{background:var(--sf);border:1px solid var(--ln);border-radius:10px;padding:.7rem .9rem}
 details[open] summary{margin-bottom:.7rem}details>*:not(summary){margin-top:.6rem}
 .note{color:var(--dim);font-size:.85rem;margin:0}
@@ -83,18 +83,17 @@ details[open] summary{margin-bottom:.7rem}details>*:not(summary){margin-top:.6re
   </div>
 
   <button class="ptt" id="ptt"><span id="pttLabel">Hold to talk</span><small id="pttHint">or hold Space</small></button>
-  <div id="lvl" aria-hidden="true"><i></i></div>
+  <div id="lvl" aria-hidden="true"><i></i><u id="thr"></u></div>
+  <button id="muteBtn" hidden>Mute mic</button>
 
-  <div class="seg" id="route" role="group" aria-label="Audio route">
-    <button data-v="speaker" aria-pressed="true">Speaker</button><button data-v="headset" aria-pressed="false">Headset</button><button data-v="bluetooth" aria-pressed="false">Bluetooth</button>
-  </div>
+  <label class="f">Listening mode<select id="route"><option value="speaker">Speaker</option><option value="headset">Headset</option><option value="bluetooth">Bluetooth</option></select></label>
 
   <details>
     <summary>Audio settings</summary>
     <label class="f">Microphone<select id="inSel"></select></label>
     <label class="f" id="outWrap">Output<select id="outSel"></select></label>
     <p class="note" id="outNote" hidden>This browser can't pick an output. Sound follows your phone's current route.</p>
-    <label class="f">Hands-free noise gate (higher blocks more background noise)<input type="range" id="gate" min="3" max="60" value="12"></label>
+    <label class="f">Hands-free sensitivity: slide left to hear quieter voices, right to ignore more background noise<input type="range" id="gate" min="2" max="60" value="8"></label>
   </details>
 </section>
 </main>
@@ -104,7 +103,7 @@ details[open] summary{margin-bottom:.7rem}details>*:not(summary){margin-top:.6re
 const $ = s => document.querySelector(s);
 const MODES = { speaker: { aec: true }, headset: { aec: false }, bluetooth: { aec: true } };
 const MAX = 10; let iceServers = [], retry = null;
-let ws, me, room, myName, stream, track, ac, src, an, buf;
+let ws, me, room, myName, stream, ac, src, an, buf, pttG, freeG, lead, dest, outTrack, floor = 0.004;
 let talkMode = 'ptt', route = 'speaker', txOn = false, muted = false, hang = 0, toastT;
 const peers = new Map();
 const sinkOK = 'setSinkId' in HTMLMediaElement.prototype;
@@ -118,38 +117,54 @@ const send = m => ws && ws.readyState === 1 && ws.send(JSON.stringify(m));
 const sig = (to, data) => send({ type: 'signal', to, data });
 
 // ---------- microphone ----------
+// Audio graph: mic -> analyser (voice detection) and mic -> gain -> one steady output track sent to everyone.
+// Opening/closing a gain (not disabling the mic track) keeps the detector able to hear you, and the
+// hands-free path is delayed ~80 ms so the first syllable isn't clipped while the gate opens.
+function ensureAudio() {
+  if (!ac) {
+    ac = new AudioContext({ latencyHint: 'interactive' });
+    an = ac.createAnalyser(); an.fftSize = 512; buf = new Float32Array(512);
+    pttG = ac.createGain(); freeG = ac.createGain(); pttG.gain.value = freeG.gain.value = 0;
+    lead = ac.createDelay(0.2); lead.delayTime.value = 0.08;
+    dest = ac.createMediaStreamDestination();
+    lead.connect(freeG); pttG.connect(dest); freeG.connect(dest);
+    outTrack = dest.stream.getAudioTracks()[0];
+  }
+  ac.resume();
+}
 async function startMic() {
+  ensureAudio();
   const c = {
     echoCancellation: MODES[route].aec, noiseSuppression: true, autoGainControl: true,
     voiceIsolation: true, channelCount: 1, sampleRate: 48000, latency: 0,
   };
   if ($('#inSel').value) c.deviceId = { exact: $('#inSel').value };
   const ns = await navigator.mediaDevices.getUserMedia({ audio: c });
-  const old = stream;
-  stream = ns; track = ns.getAudioTracks()[0]; track.enabled = txOn;
-  peers.forEach(p => p.pc && p.pc.getSenders().forEach(s => s.replaceTrack(track)));
-  old && old.getTracks().forEach(t => t.stop());
-  ac = ac || new AudioContext({ latencyHint: 'interactive' });
-  ac.resume();
+  const old = stream; stream = ns;
   src && src.disconnect();
-  src = ac.createMediaStreamSource(stream);
-  an = ac.createAnalyser(); an.fftSize = 512; buf = new Float32Array(512);
-  src.connect(an);
+  src = ac.createMediaStreamSource(ns);
+  src.connect(an); src.connect(pttG); src.connect(lead);
+  old && old.getTracks().forEach(t => t.stop());
+  ac.resume();
 }
 
-// Level meter + hands-free noise gate (opens on voice, holds 450 ms so words aren't clipped)
+// Hands-free: detects your voice against the room's background level (adapts automatically), holds open 0.5 s after you stop.
 setInterval(() => {
-  if (!an) return;
+  if (!an || !room) return;
   an.getFloatTimeDomainData(buf);
-  let s = 0; for (const v of buf) s += v * v;
-  const r = Math.sqrt(s / buf.length);
+  let sum = 0; for (const v of buf) sum += v * v;
+  const r = Math.sqrt(sum / buf.length);
+  const thr = Math.max($('#gate').value / 1000, floor * 3);
+  if (r < floor) floor = r; else if (r < thr) floor += (r - floor) * 0.01;
+  floor = Math.min(floor, 0.02);
   $('#lvl i').style.transform = `scaleX(${Math.min(1, r * 6)})`;
-  if (talkMode === 'free' && !muted && room) {
+  $('#thr').style.left = `${Math.min(100, thr * 600)}%`;
+  if (talkMode === 'free' && !muted) {
     const now = performance.now();
-    if (r > $('#gate').value / 1000) hang = now + 450;
+    if (r > thr) hang = now + 500;
     setTx(now < hang);
   }
-}, 30);
+}, 25);
 
 // ---------- devices / route ----------
 async function refreshDevices() {
@@ -167,7 +182,7 @@ const pick = (sel, re) => { const o = [...sel.options].find(o => o.value && re.t
 
 async function setRoute(r) {
   route = r;
-  document.querySelectorAll('#route button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === r));
+  $('#route').value = r;
   await refreshDevices();
   $('#inSel').value = ''; $('#outSel').value = '';
   if (r === 'speaker') pick($('#outSel'), /speaker/i);
@@ -201,7 +216,7 @@ function mk(p) {
 }
 async function initiate(p) {
   const pc = mk(p);
-  pc.addTrack(track, stream);
+  pc.addTrack(outTrack, dest.stream);
   const o = await pc.createOffer();
   await pc.setLocalDescription({ type: 'offer', sdp: tune(o.sdp) });
   sig(p.id, { sdp: pc.localDescription });
@@ -212,7 +227,7 @@ async function onSignal(from, d) {
   if (d.sdp) {
     await pc.setRemoteDescription(d.sdp);
     if (d.sdp.type === 'offer') {
-      pc.addTrack(track, stream);
+      pc.addTrack(outTrack, dest.stream);
       const a = await pc.createAnswer();
       await pc.setLocalDescription({ type: 'answer', sdp: tune(a.sdp) });
       sig(from, { sdp: pc.localDescription });
@@ -257,18 +272,22 @@ function ui() {
   const b = $('#ptt');
   b.classList.toggle('tx', txOn); b.classList.toggle('muted', talkMode === 'free' && muted);
   if (talkMode === 'ptt') { $('#pttLabel').textContent = txOn ? 'Talking' : 'Hold to talk'; $('#pttHint').textContent = 'or hold Space'; }
-  else { $('#pttLabel').textContent = muted ? 'Muted' : txOn ? 'Talking' : 'Listening'; $('#pttHint').textContent = muted ? 'Tap to unmute' : 'Tap to mute'; }
+  else { $('#pttLabel').textContent = muted ? 'Muted' : txOn ? 'Talking' : 'Listening'; $('#pttHint').textContent = muted ? 'Mic is off' : 'Just speak. No button needed.'; $('#muteBtn').textContent = muted ? 'Unmute mic' : 'Mute mic'; }
 }
 function setTx(on) {
   if (talkMode === 'free' && muted) on = false;
   if (on === txOn) return;
-  txOn = on; if (track) track.enabled = on;
+  txOn = on;
+  (talkMode === 'ptt' ? pttG : freeG).gain.setTargetAtTime(on ? 1 : 0, ac.currentTime, 0.008);
   send({ type: 'talking', on }); ui(); renderList();
 }
 function setTalkMode(m) {
-  talkMode = m; muted = false; setTx(false);
+  pttG.gain.value = freeG.gain.value = 0;
+  if (txOn) { txOn = false; send({ type: 'talking', on: false }); }
+  talkMode = m; muted = false; hang = 0;
   document.querySelectorAll('#talkMode button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === m));
-  ui();
+  $('#muteBtn').hidden = m !== 'free'; $('#thr').style.display = m === 'free' ? 'block' : 'none';
+  ui(); renderList();
 }
 function showRoom() {
   $('#join').hidden = true; $('#roomView').hidden = false;
@@ -282,11 +301,13 @@ function leave() {
   room = null; retry = null; ws && ws.close(); ws = null;
   [...peers.keys()].forEach(dropPeer);
   stream && stream.getTracks().forEach(t => t.stop());
-  stream = track = an = null; txOn = false; muted = false;
+  src && src.disconnect(); src = null; stream = null; pttG && (pttG.gain.value = freeG.gain.value = 0);
+  txOn = false; muted = false;
   $('#join').hidden = false; $('#roomView').hidden = true; $('#qrbox').hidden = true;
 }
 
 async function enter(kind) {
+  ensureAudio();
   myName = ($('#name').value.trim() || 'Guest').slice(0, 20);
   try { localStorage.setItem('lt-name', myName); } catch {}
   const code = $('#code').value.trim();
@@ -313,15 +334,15 @@ $('#joinBtn').onclick = () => enter('join');
 $('#leave').onclick = leave;
 $('#qrBtn').onclick = e => { const h = $('#qrbox').hidden = !$('#qrbox').hidden; e.target.setAttribute('aria-expanded', !h); };
 $('#talkMode').onclick = e => e.target.dataset.v && setTalkMode(e.target.dataset.v);
-$('#route').onclick = e => e.target.dataset.v && setRoute(e.target.dataset.v);
+$('#route').onchange = e => setRoute(e.target.value);
 $('#inSel').onchange = () => startMic().catch(() => toast('Could not use that microphone.'));
 $('#outSel').onchange = applySinks;
 navigator.mediaDevices && (navigator.mediaDevices.ondevicechange = () => room && refreshDevices().catch(() => {}));
 
 const ptt = $('#ptt');
-ptt.onpointerdown = e => { ptt.setPointerCapture(e.pointerId); if (talkMode === 'ptt') setTx(true); };
-ptt.onpointerup = () => { if (talkMode === 'ptt') setTx(false); else { muted = !muted; if (muted) setTx(false); ui(); } };
-ptt.onpointercancel = () => talkMode === 'ptt' && setTx(false);
+ptt.onpointerdown = e => { ptt.setPointerCapture(e.pointerId); ac && ac.resume(); if (talkMode === 'ptt') setTx(true); };
+ptt.onpointerup = ptt.onpointercancel = () => talkMode === 'ptt' && setTx(false);
+$('#muteBtn').onclick = () => { muted = !muted; if (muted) setTx(false); ui(); };
 ptt.oncontextmenu = e => e.preventDefault();
 const typing = e => /INPUT|SELECT|BUTTON/.test(e.target.tagName) && e.target !== ptt;
 addEventListener('keydown', e => { if (e.code === 'Space' && !e.repeat && room && talkMode === 'ptt' && !typing(e)) { e.preventDefault(); setTx(true); } });
