@@ -61,15 +61,22 @@ export class Room {
 
     ws.addEventListener('message', ev => {
       let m; try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.type === 'ping') return send(ws, { type: 'pong' });
 
       if (!joined && (m.type === 'create' || m.type === 'join')) {
+        // Same device coming back on a new network: drop its stale connection first.
+        const dev = String(m.cid || '').slice(0, 16);
+        if (dev) for (const [pid, p] of [...this.peers]) if (p.cid === dev) {
+          this.peers.delete(pid); try { p.ws.close(); } catch {}
+          this.peers.forEach(q => send(q.ws, { type: 'peer-left', id: pid }));
+        }
         if (m.type === 'create' && this.peers.size) return send(ws, { type: 'error', code: 'taken', msg: 'Code already in use.' });
-        if (m.type === 'join' && !this.peers.size) return send(ws, { type: 'error', msg: 'Room not found. Check the code.' });
+        if (m.type === 'join' && !this.peers.size) return send(ws, { type: 'error', code: 'notfound', msg: 'Room not found. Check the code.' });
         if (this.peers.size >= MAX) return send(ws, { type: 'error', msg: `Room is full (${MAX} max).` });
         const name = String(m.name || 'Guest').slice(0, 20);
         send(ws, { type: 'joined', id, room: code, peers: [...this.peers].map(([pid, p]) => ({ id: pid, name: p.name })) });
         this.peers.forEach(p => send(p.ws, { type: 'peer-joined', id, name }));
-        this.peers.set(id, { ws, name });
+        this.peers.set(id, { ws, name, cid: dev });
         joined = true;
         return;
       }

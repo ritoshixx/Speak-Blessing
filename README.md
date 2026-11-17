@@ -23,3 +23,9 @@ Cloudflare dashboard > Realtime > TURN > create a key, then
 ## Note
 Everyone now needs internet to reach the Worker (a hotspot with mobile data is enough). It no longer works fully offline;
 use the earlier Node version for that.
+
+## Moving out of hotspot range
+If someone leaves the hotspot and their phone switches to mobile data (or comes back), the app notices, rejoins the same room
+by itself, and reconnects audio over whichever route works (the member badge changes from `local` to `internet`).
+Between a hotspot and mobile data, a direct connection usually works but not always (some mobile carriers block it).
+For those cases, turn on the TURN relay described above so audio can still get through.
