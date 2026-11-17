@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0e1a1a">
-<title>LAN Talk</title>
+<title>Speak Blessing</title>
 <style>
 :root{--bg:#0e1a1a;--sf:#162726;--ln:#2a4543;--tx:#e8efe4;--dim:#93aca4;--on:#f4c430;--rx:#5fe3a8;--bad:#ff7a6e;
 --disp:"Bahnschrift","DIN Alternate","Avenir Next Condensed","Roboto Condensed",system-ui,sans-serif}
@@ -53,17 +53,21 @@ box-shadow:inset 0 0 0 2px var(--ln),0 0 0 8px var(--bg),0 0 0 10px var(--ln);fo
 details{background:var(--sf);border:1px solid var(--ln);border-radius:10px;padding:.7rem .9rem}
 details[open] summary{margin-bottom:.7rem}details>*:not(summary){margin-top:.6rem}
 .note{color:var(--dim);font-size:.85rem;margin:0}
+#scan{position:fixed;inset:0;background:#000;z-index:5;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1rem;padding:1rem}#scan video{width:100%;max-width:30rem;max-height:70vh;object-fit:cover;border-radius:14px}#scan p{margin:0;color:#fff;text-align:center}
+footer{margin-top:auto;padding-top:1.2rem;text-align:center;color:var(--dim);font-size:.8rem;line-height:1.6}
 #toast{position:fixed;left:50%;bottom:max(1rem,env(safe-area-inset-bottom));transform:translateX(-50%);background:#fff;color:#111;padding:.7rem 1rem;border-radius:10px;max-width:90vw;font-size:.95rem;box-shadow:0 4px 20px #0008}
 </style>
 </head>
 <body>
 <main>
 <section id="join">
-  <h1>LAN Talk</h1>
+  <h1>Speak Blessing</h1>
   <p class="sub">Voice rooms for people on the same Wi-Fi or hotspot.</p>
   <div style="display:grid;gap:.9rem">
     <label class="f">Your name<input id="name" maxlength="20" autocomplete="nickname" placeholder="Guest"></label>
+    <button class="primary" id="quickJoin" hidden></button>
     <button class="primary" id="create">Create a room</button>
+    <button id="scanBtn">Scan QR code to join</button>
     <div class="or">or join with a code</div>
     <div class="row"><input id="code" inputmode="numeric" pattern="[0-9]*" maxlength="4" placeholder="0000" aria-label="4-digit room code"><button id="joinBtn">Join room</button></div>
   </div>
@@ -74,7 +78,7 @@ details[open] summary{margin-bottom:.7rem}details>*:not(summary){margin-top:.6re
     <div class="code" id="codeTiles" aria-label="Room code"></div>
     <div class="row" style="flex:none"><button id="qrBtn" aria-expanded="false">QR code</button><button id="leave">Leave</button></div>
   </div>
-  <div id="qrbox" hidden><img id="qr" alt="QR code to join this room"><small id="url"></small></div>
+  <div id="qrbox" hidden><img id="qr" alt="QR code to join this room"><small style="margin-bottom:.4rem">Scan with Speak Blessing (Scan QR code) or any camera app</small><small id="url"></small></div>
 
   <div><p class="cnt" id="count"></p><ul id="members"></ul></div>
 
@@ -96,7 +100,13 @@ details[open] summary{margin-bottom:.7rem}details>*:not(summary){margin-top:.6re
     <label class="f">Hands-free sensitivity: slide left to hear quieter voices, right to ignore more background noise<input type="range" id="gate" min="2" max="60" value="8"></label>
   </details>
 </section>
+<footer><div>&copy; 2026 Speak Blessing. All rights reserved.</div><div>Developed by: Christian Javier</div></footer>
 </main>
+<div id="scan" hidden role="dialog" aria-label="Scan QR code">
+  <video id="scanVideo" playsinline muted></video>
+  <p>Point the camera at the room's QR code. You'll join automatically.</p>
+  <button id="scanCancel">Cancel</button>
+</div>
 <div id="toast" role="status" aria-live="polite" hidden></div>
 
 <script>
@@ -111,6 +121,7 @@ const sinkOK = 'setSinkId' in HTMLMediaElement.prototype;
 try { $('#name').value = localStorage.getItem('lt-name') || ''; } catch {}
 const q = new URLSearchParams(location.search).get('room');
 if (q) $('#code').value = q.replace(/\D/g, '').slice(0, 4);
+if (/^\d{4}$/.test($('#code').value)) { const b = $('#quickJoin'); b.textContent = `Join room ${$('#code').value}`; b.hidden = false; }
 
 function toast(t) { const el = $('#toast'); el.textContent = t; el.hidden = false; clearTimeout(toastT); toastT = setTimeout(() => el.hidden = true, 4500); }
 const send = m => ws && ws.readyState === 1 && ws.send(JSON.stringify(m));
@@ -329,6 +340,57 @@ async function enter(kind) {
   open(kind === 'create' ? rnd() : code);
 }
 
+// ---------- QR scanner: scans, then joins by itself ----------
+let scanStream, scanTimer, warned = false;
+const roomFrom = text => {
+  try { const r = new URL(text).searchParams.get('room'); if (/^\d{4}$/.test(r)) return r; } catch {}
+  return /^\d{4}$/.test(text.trim()) ? text.trim() : null;
+};
+const loadJsQR = () => new Promise((ok, no) => {
+  if (window.jsQR) return ok();
+  const el = document.createElement('script');
+  el.src = 'https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js';
+  el.onload = ok; el.onerror = no; document.head.append(el);
+});
+function stopScan() {
+  clearInterval(scanTimer); scanTimer = null;
+  scanStream && scanStream.getTracks().forEach(t => t.stop()); scanStream = null;
+  $('#scan').hidden = true;
+}
+async function scanQR() {
+  ensureAudio(); warned = false;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return toast('Camera needs a secure page (https).');
+  try { scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false }); }
+  catch { return toast('Camera blocked. Allow it in your browser, or type the code.'); }
+  const v = $('#scanVideo'); v.srcObject = scanStream; await v.play().catch(() => {});
+  $('#scan').hidden = false;
+  let det = null;
+  if ('BarcodeDetector' in window) { try { det = new BarcodeDetector({ formats: ['qr_code'] }); } catch {} }
+  if (!det) { try { await loadJsQR(); } catch {} }
+  if (!det && !window.jsQR) { stopScan(); return toast('This browser cannot scan here. Use your camera app or type the code.'); }
+  const cv = document.createElement('canvas'), cx = cv.getContext('2d', { willReadFrequently: true });
+  scanTimer = setInterval(async () => {
+    if (v.readyState < 2 || !v.videoWidth) return;
+    let text = '';
+    try {
+      if (det) { const r = await det.detect(v); text = (r[0] && r[0].rawValue) || ''; }
+      else {
+        const k = Math.min(1, 480 / v.videoWidth);
+        cv.width = Math.round(v.videoWidth * k); cv.height = Math.round(v.videoHeight * k);
+        cx.drawImage(v, 0, 0, cv.width, cv.height);
+        const d = cx.getImageData(0, 0, cv.width, cv.height);
+        const res = window.jsQR(d.data, d.width, d.height); text = res ? res.data : '';
+      }
+    } catch {}
+    if (!text) return;
+    const c = roomFrom(text);
+    if (c) { stopScan(); $('#code').value = c; enter('join'); }
+    else if (!warned) { warned = true; toast('That QR code is not a Speak Blessing room.'); }
+  }, 250);
+}
+$('#scanBtn').onclick = scanQR;
+$('#scanCancel').onclick = stopScan;
+$('#quickJoin').onclick = () => enter('join');
 $('#create').onclick = () => enter('create');
 $('#joinBtn').onclick = () => enter('join');
 $('#leave').onclick = leave;
